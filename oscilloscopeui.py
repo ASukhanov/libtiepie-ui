@@ -30,6 +30,8 @@ from __future__ import print_function
 # libtiepie-ui and the licenses of the other code concerned.
 #
 version = 'v03 2016-08-18 by Andrei Sukhanov'
+version = 'v04 2016-08-18 by Andrei Sukhanov' # added ofsets, arrows
+
 import logging, sys
 logging.basicConfig(stream=sys.stderr, level=logging.INFO)
 #logging.basicConfig(stream=sys.stderr, level=logging.DEBUG) # uncomment this for debugging
@@ -88,10 +90,6 @@ PERSISTENCY = [
   #{"value": 1000, "name": "1000 sweeps"},
   {"value": 1.e6, "name": "unlimited"},
 ]            
-STEPMODE = [
-  {"value": 1, "name": "Steps"},
-  {"value": 0, "name": "Connects"},
-]            
 
 TRIGGER_HYSTERESES = [10, 5, 2, 1]
 
@@ -108,6 +106,15 @@ MENU_CHANNEL_RANGE_INDEX = 3
 
 class OscilloscopeUI(QMainWindow):
     def __init__(self, scp, parent=None):
+        self.statusbar = False
+        self.stepMode = 1
+        self.persistency = 1
+        self.nDiv=8. # Number of vertical divisions
+        self.gain = []
+        self.offset = []
+        self.arrow = []
+        self.sweepCount = 0
+        
         super(OscilloscopeUI, self).__init__(parent)
 
         self._scp = scp
@@ -122,6 +129,9 @@ class OscilloscopeUI(QMainWindow):
         if scp.has_trigger_hold_off:
             scp.trigger_holf_off_count = libtiepie.TH_ALLPRESAMPLES            
 
+        self.glw = pyqtgraph.GraphicsLayoutWidget(self)
+        self.setCentralWidget(self.glw)
+
         self._setup_menu()
         logging.debug('menu set')
         self._setup_toolbar()
@@ -129,22 +139,28 @@ class OscilloscopeUI(QMainWindow):
         self._setup_events()
         logging.debug('events set')
 
-        self.glw = pyqtgraph.GraphicsLayoutWidget(self)
-        self.setCentralWidget(self.glw)
-
         self.setWindowTitle(scp.name + " s/n " + str(scp.serial_number))
         self.resize(800, 600)
+        logging.debug('width='+str(self.frameGeometry().width()))
 
         self.plot = self.glw.addPlot(0, 0)
         self.plot.showGrid(x=True,y=True)
-        self.stepMode = 1
-        self.persistency = 1
-        self.nDiv=8. # Number of vertical divisions
-        self.gain = []
-        for ch in range(len(scp.channels)):
+        for chnum in range(len(scp.channels)):
           self.gain.extend([0.])
+          self.offset.extend([0.])
         self._update_labels()
-
+        
+        #''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''
+    def _replot(self):
+      logging.debug('replot')
+      for chnum in range(len(self._scp.channels)):
+        if self._scp.channels[chnum].enabled:
+          logging.debug('adding arrow '+str(chnum)+' at offset '+str(self.offset[chnum]))
+          arrow = pyqtgraph.ArrowItem(pos=(0, self.offset[chnum]), angle=-180)
+          self.arrow.extend([arrow])
+          #self.plot.addItem(self.arrow[chnum])
+          self.plot.addItem(arrow)
+          
     def _setup_menu(self):
         scp = self._scp
 
@@ -169,15 +185,15 @@ class OscilloscopeUI(QMainWindow):
 
         # Channels:
         self._menu_channels = []
-        for i in range(len(scp.channels)):
-            ch = scp.channels[i]
+        for chnum in range(len(scp.channels)):
+            ch = scp.channels[chnum]
 
-            menu = self.menuBar().addMenu("Ch" + str(i + 1))
+            menu = self.menuBar().addMenu("Ch" + str(chnum + 1))
             action = menu.addAction("Enabled")
             action.setCheckable(True)
-            if i == 0:  #&RA
+            if chnum == 0:  #&RA
               action.setChecked(ch.enabled)
-            action.setData(i)
+            action.setData(chnum)
             action.toggled.connect(self._channel_enabled_changed)
 
             submenu = menu.addMenu("Coupling")
@@ -187,28 +203,22 @@ class OscilloscopeUI(QMainWindow):
                     action = submenu.addAction(ck["name"])
                     action.setCheckable(True)
                     action.setChecked(ch.coupling == ck["value"])
-                    action.setData({"ch": i, "ck": ck["value"]})
+                    action.setData({"ch": chnum, "ck": ck["value"]})
                     action.toggled.connect(self._channel_coupling_changed)
                     act_group.addAction(action)
 
             menu.addMenu("Gain")
             act_group = QActionGroup(self)
             self._menu_channels.append({"menu": menu, "gain_action_group": act_group})
-            self._update_channel_gain(i)
+            self._update_channel_gain(chnum)
 
-            parent = menu.addMenu("Offset")            
-            act_group = QActionGroup(self)
-            #self._menu_channels.append({"menu": menu, "offset_action_group": act_group})
-            dsb = QDoubleSpinBox()
-            dsb.setDecimals(3)
-            #parent.addWidget(QLabel("Offset:"), 0, 0)
-            ''' TODO        
-            mainLayout.addWidget(QLabel("Offset:"), ROW_FREQUENCY, 0)
-            mainLayout.addWidget(dsb, ROW_OFFSET, 1)
-            mainLayout.addWidget(QLabel("Hz"), ROW_OFFSET, 2)
-            self._frequency = dsb
-            '''
-
+            # Offset:
+            action = menu.addAction('Offset')
+            if chnum == 0:
+              action.triggered.connect(self._change_offset0)
+            else:
+              action.triggered.connect(self._change_offset1)
+            
         # Trigger:
         self._menu_trigger = self.menuBar().addMenu("Trigger")
 
@@ -224,15 +234,15 @@ class OscilloscopeUI(QMainWindow):
 
         submenu = self._menu_trigger.addMenu("Source")
         act_group = QActionGroup(self)
-        for i in range(len(scp.channels)):
-            action = submenu.addAction("Ch" + str(i + 1))
+        for chnum in range(len(scp.channels)):
+            action = submenu.addAction("Ch" + str(chnum + 1))
             action.setCheckable(True)
-            action.setChecked(scp.channels[i].trigger.enabled)
-            action.setData({"ch": i})
+            action.setChecked(scp.channels[chnum].trigger.enabled)
+            action.setData({"ch": chnum})
             action.toggled.connect(self._trigger_source_changed)
             act_group.addAction(action)
             if action.isChecked():
-                self._trigger_source = scp.channels[i].trigger
+                self._trigger_source = scp.channels[chnum].trigger
         for i in range(len(scp.trigger_inputs)):
             trin = scp.trigger_inputs[i]
             action = submenu.addAction(trin.name)
@@ -278,7 +288,7 @@ class OscilloscopeUI(QMainWindow):
                 action.toggled.connect(self._trigger_hysteresis_changed)
                 act_group.addAction(action)
             i += 1
-
+        #''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''
         self._menu_display = self.menuBar().addMenu("Display")
         submenu = self._menu_display.addMenu("Persistency")
         act_group = QActionGroup(self)
@@ -289,15 +299,17 @@ class OscilloscopeUI(QMainWindow):
             action.setData(item["value"])
             action.toggled.connect(self._persistency_changed)
             act_group.addAction(action)
-        submenu = self._menu_display.addMenu("StepMode")
-        act_group = QActionGroup(self)
-        for item in STEPMODE:
-            action = submenu.addAction(item["name"])
-            action.setCheckable(True)
-            action.setData(item["value"])
-            action.toggled.connect(self._stepmode_changed)
-            act_group.addAction(action)                   
-
+       
+        action = self._menu_display.addAction('StepMode')
+        action.setCheckable(True)
+        action.setChecked(True)
+        action.triggered.connect(self._stepmode_changed)
+        
+        action = self._menu_display.addAction('StatusBar')
+        action.setCheckable(True)
+        action.setChecked(self.statusbar)
+        action.triggered.connect(self._statusbar_changed)
+       #,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,
         self._update_sample_frequency()
         self._update_record_length()
         self._update_trigger_source()
@@ -320,7 +332,9 @@ class OscilloscopeUI(QMainWindow):
         self._scp.set_event_data_ready(self._fd_dataready)
         self._notifier_dataready = QSocketNotifier(self._fd_dataready, QSocketNotifier.Read, self)
         self._notifier_dataready.activated.connect(self._event_dataready)
-
+    #,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,
+    #''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''
+    #                       Handlers for changed items
     def _sample_frequency_changed(self, checked):
         if checked:
             self._scp.sample_frequency = utils.unwrap_QVariant(self.sender().data())
@@ -405,6 +419,36 @@ class OscilloscopeUI(QMainWindow):
             data = utils.unwrap_QVariant(self.sender().data())
             self._trigger_source.times[data["index"]] = data["value"]
 
+    def _persistency_changed(self, checked):
+        if checked:
+            self.persistency = utils.unwrap_QVariant(self.sender().data())
+            logging.debug('persistency changed to '+str(self.persistency))
+        else:
+            self.persistency = 1
+        if self.persistency != 1:
+          QMessageBox.about(self, "Warning", "Persistency!=1 is causing memory leaks!") #,icon=QMessageBox.Warning)
+
+    def _stepmode_changed(self, checked):
+        self.stepMode = 1 if checked==True else 0
+    def _statusbar_changed(self, checked):
+        self.statusbar = 1 if checked==True else 0
+    def _slider_changed(self, value):
+        print(str(value))
+        
+    def _offset_dialog(self,chnum):
+      text, ok = QInputDialog.getText(self, 'Input Dialog', 
+        'Enter offset for ch '+str(chnum)+':')
+      if ok:
+        self.offset[chnum] = float(text)
+        logging.debug('offset ['+str(chnum)+']='+str(self.offset[chnum]))        
+    def _change_offset0(self):
+      self._offset_dialog(0)
+    def _change_offset1(self):
+      self._offset_dialog(1)
+      
+    #,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,
+    #''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''
+    #                   Handlers for updatetable items
     def _update_sample_frequency(self):
         sample_frequency = self._scp.sample_frequency
         menu = self._menu_sample_frequency
@@ -422,6 +466,7 @@ class OscilloscopeUI(QMainWindow):
         record_length = self._scp.record_length
         menu = self._menu_record_length
         menu.clear()
+
         for value in reversed(utils.sequence_125(self._scp.verify_record_length(RECORD_LENGTH_MIN), self._scp.verify_record_length(RECORD_LENGTH_MAX))):
             action = menu.addAction(utils.val_to_str(value, 3, 0) + "Samples")
             action.setCheckable(True)
@@ -542,12 +587,13 @@ class OscilloscopeUI(QMainWindow):
         # update legends, not a nice way
         logging.debug('remove plot')
         self.glw.removeItem(self.plot)
-        logging.debug('add plot')
+        logging.debug('adding plot')
         self.plot = self.glw.addPlot(0, 0)
         self.plot.addLegend()
         self.plot.showGrid(x=True,y=True)
         self.plot.setYRange(-self.nDiv,self.nDiv)
         self.plot.setXRange(0,100)
+        self._replot()
        
         for chnum in range(nch):
           if self._scp.channels[chnum].enabled:
@@ -555,25 +601,15 @@ class OscilloscopeUI(QMainWindow):
             self.gain[chnum] = rangeY/self.nDiv
             logging.debug('range['+str(chnum)+']='+str(rangeY)+' gain='+str(self.gain[chnum]))
             self.plot.plot(pen=LINE_COLORS[chnum % len(LINE_COLORS)],name=str(self.gain[chnum])+' V/div')
-
-    def _persistency_changed(self, checked):
-        if checked:
-            self.persistency = utils.unwrap_QVariant(self.sender().data())
-            logging.debug('persistency changed to '+str(self.persistency))
-        else:
-            self.persistency = 1
-
-    def _stepmode_changed(self, checked):
-        if checked:
-            self.stepMode = utils.unwrap_QVariant(self.sender().data()) == 1
-            logging.debug('stepmode changed to '+str(self.stepMode))
-        else:
-            self.stepMode = 0
-
+    #,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,
+    #''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''          
     def _go(self):
+        self.sweepCount = 0
         logging.debug('setYRange '+str(self.nDiv)+','+str(-self.nDiv))
         self.plot.setYRange(-self.nDiv,self.nDiv)
         self.plot.clear()
+        logging.debug('plot cleared')
+        self._replot()
         self._scp.start()
 
     def _start(self, checked):
@@ -613,7 +649,9 @@ class OscilloscopeUI(QMainWindow):
             libtiepie.api.ScpGetData(scp._handle, pointers, channel_count, start, length)
         finally:
             libtiepie.api.HlpPointerArrayDelete(pointers)
-
+        self.sweepCount +=1
+        if self.statusbar:
+          self.statusBar().showMessage('Sweeps:'+str(self.sweepCount))
         # Plot data
         '''
         for chnum in range(len(self._scp.channels)):
@@ -622,11 +660,14 @@ class OscilloscopeUI(QMainWindow):
         '''
         i = 0
         if self.persistency == 1:
+            #TODO remove previous waveforms instead of replotting
             self.plot.clear()
+            logging.debug('plot cleared')
+            self._replot()
         #&RA/for chnum, chdata in zip(range(len(self._scp.channels)), data):
         for chnum in range(len(self._scp.channels)):
           if self._scp.channels[chnum].enabled:
-            chdata = data[chnum]/self.gain[chnum]
+            chdata = data[chnum]/self.gain[chnum] + self.offset[chnum]
             if chdata is not None:
                 ch = self._scp.channels[chnum]
                 legend = str(chnum)
